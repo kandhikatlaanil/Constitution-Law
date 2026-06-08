@@ -1,0 +1,210 @@
+{
+  "app_name": "Constitution & Law",
+  "platform": "React Native Expo (SDK 54, expo-router)",
+  "theme_and_archetype": {
+    "domain": "Law, Constitution, Reading Application",
+    "archetype": "Authoritative Reading (Constitution-inspired)",
+    "tone": "Authoritative, Trustworthy, Highly Legible, Premium, Cinematic"
+  },
+  "colors": {
+    "dark": {
+      "background": "#0F0F0F",
+      "surface": "#1A1A1A",
+      "surface_elevated": "#262626",
+      "primary": "#D9A95C",
+      "primary_light": "#E0B36A",
+      "text_primary": "#F3F4F6",
+      "text_secondary": "#A1A1AA",
+      "text_muted": "#71717A",
+      "border": "#27272A",
+      "tiles": {
+        "articles": "#AD7270",
+        "constitution": "#C0A080",
+        "duties": "#7B967D"
+      }
+    },
+    "light": {
+      "background": "#FDFBF7",
+      "surface": "#FFFFFF",
+      "surface_elevated": "#F4F0EA",
+      "primary": "#B48645",
+      "primary_light": "#D9A95C",
+      "text_primary": "#18181B",
+      "text_secondary": "#52525B",
+      "text_muted": "#A1A1AA",
+      "border": "#E4E4E7",
+      "tiles": {
+        "articles": "#C78D8B",
+        "constitution": "#D4B799",
+        "duties": "#94B096"
+      }
+    },
+    "tts_highlight": {
+      "active_bg": "rgba(217, 169, 92, 0.25)",
+      "active_text": "#D9A95C",
+      "read_text": "#71717A",
+      "unread_text_variable": "text_primary"
+    }
+  },
+  "typography": {
+    "font_families": {
+      "heading": "Lora",
+      "body": "Merriweather",
+      "ui": "Outfit",
+      "fallback": "System"
+    },
+    "scales": {
+      "h1_title": { "size": 28, "weight": "700", "line_height": 34, "font": "heading", "letter_spacing": 0.5 },
+      "h2_section": { "size": 22, "weight": "600", "line_height": 28, "font": "heading" },
+      "h3_subsection": { "size": 18, "weight": "700", "line_height": 24, "font": "heading", "color": "primary" },
+      "body_reading": { "size": 17, "weight": "400", "line_height": 28, "font": "body" },
+      "body_ui": { "size": 15, "weight": "400", "line_height": 20, "font": "ui" },
+      "small_label": { "size": 12, "weight": "500", "line_height": 16, "font": "ui", "letter_spacing": 1.2, "text_transform": "uppercase" }
+    }
+  },
+  "spacing_and_layout": {
+    "screen_padding": 16,
+    "card_padding": 16,
+    "card_border_radius": 12,
+    "button_border_radius": 24,
+    "pill_border_radius": 9999,
+    "bottom_tab_height": 64,
+    "gap_small": 8,
+    "gap_medium": 16,
+    "gap_large": 24,
+    "gap_xl": 32
+  },
+  "components": {
+    "bottom_tab_bar": {
+      "style": "Line icons, transparent background with slight blur (if supported) or solid surface color.",
+      "active_color": "primary",
+      "inactive_color": "text_secondary",
+      "icons": {
+        "home": "home-outline",
+        "constitution": "book-outline",
+        "law": "scale-balance",
+        "explore": "compass-outline",
+        "you": "person-outline"
+      }
+    },
+    "top_reader_bar": {
+      "actions": ["Listen (speaker)", "Search (magnifying glass)", "Language Glyph", "Menu (hamburger)"],
+      "icon_size": 24,
+      "color": "text_primary"
+    },
+    "dropdown_selectors": {
+      "shape": "Pill (rounded-full)",
+      "border": "1px solid border_color",
+      "padding": "8px 16px",
+      "typography": "body_ui"
+    },
+    "play_button": {
+      "shape": "Circular",
+      "border": "2px solid primary",
+      "icon_color": "primary",
+      "size": 48
+    },
+    "auto_scroll_toggle": {
+      "layout": "Row (Label + Switch/Toggle component)",
+      "label_typography": "body_ui",
+      "track_active": "primary"
+    },
+    "related_chips": {
+      "shape": "Pill (rounded-full)",
+      "border": "1px solid primary",
+      "text_color": "primary",
+      "background": "transparent",
+      "padding": "6px 12px",
+      "margin_right": 8
+    },
+    "home_category_tiles": {
+      "shape": "Rounded rectangle (12px)",
+      "padding": 16,
+      "typography": "h3_subsection (but in white/light text for contrast)"
+    },
+    "achievement_badges": {
+      "shape": "Circular",
+      "size": 64,
+      "border": "2px solid primary_light"
+    }
+  },
+  "screens": {
+    "Home": {
+      "layout": "Vertical ScrollView",
+      "sections": [
+        "Hero Greeting Card (Welcome message, date/quote)",
+        "Recently Opened (Horizontal Scroll of cards)",
+        "Guided Articles Carousel (Using home_category_tiles colors)",
+        "Plan of Articles / Plan of the Constitution / Plan of Fundamental Duties (Promo rows)",
+        "Achievements & Badges (Horizontal Scroll)",
+        "Stats Strip (Articles Read, Bookmarks, Study Streak, Goal Progress)",
+        "Upcoming Features Widgets"
+      ]
+    },
+    "ConstitutionReader": {
+      "layout": "Top Header -> Dropdowns -> Content ScrollView -> Bottom Nav Bar",
+      "elements": [
+        "Top reader bar (Listen, Search, Language, Menu)",
+        "Row: Part Dropdown + Play Button + Auto Scroll Toggle",
+        "Article Number (h2_section, primary color)",
+        "Article Title (h1_title)",
+        "Content HTML (body_reading)",
+        "Explanation Sub-header (h3_subsection, primary color) + text",
+        "Key Points Sub-header (h3_subsection, primary color) + bulleted list",
+        "Related Articles (Horizontal ScrollView of related_chips)",
+        "Action Icons: Bookmark (outline), Share",
+        "Bottom Sticky Nav: Previous Article | Next Article"
+      ]
+    },
+    "ConstitutionTOC": {
+      "layout": "Accordion List",
+      "elements": [
+        "Parts (Accordion Headers)",
+        "Expanded state: Grid (3 or 4 columns) of Article Number tiles (square, primary border)"
+      ]
+    },
+    "LawReader": {
+      "layout": "Similar to ConstitutionReader",
+      "elements": [
+        "Row: Law Book Dropdown (book icon) + Chapter Dropdown (list icon)",
+        "Play Button + Auto Scroll Toggle",
+        "Section Number (h2_section, primary)",
+        "Title, Content, Explanation, Key Points, Related Sections, Prev/Next Nav"
+      ]
+    },
+    "ListenAudioMode": {
+      "behavior": [
+        "Text-to-speech engine running",
+        "Floating or Bottom Sheet controls: Play/Pause/Stop, Speed (1x, 1.5x, etc.), Voice selection",
+        "Content highlighting: Current sentence uses `active_bg` and `active_text`. Previous sentences use `read_text`. Upcoming use `unread_text_variable`.",
+        "Auto-scroll syncs with active sentence."
+      ]
+    },
+    "YouProfile": {
+      "layout": "Vertical Settings List",
+      "sections": [
+        "Profile Header (Avatar, Name, Email)",
+        "Selected Language Display",
+        "Selected Theme Display",
+        "Settings Group (Theme Toggle, Language Selector, Notifications Toggle)",
+        "About Group (Version, Privacy Policy, Terms, Contact)"
+      ]
+    }
+  },
+  "testing": {
+    "requirements": "All interactive and key informational elements MUST include a `testID` (React Native equivalent of data-testid).",
+    "convention": "kebab-case, role-based. Example: `testID=\"home-tab-button\"`, `testID=\"article-play-button\"`, `testID=\"theme-toggle-switch\"`."
+  },
+  "internationalization": {
+    "supported_languages": ["English", "Telugu", "Hindi", "Tamil", "Kannada", "Malayalam"],
+    "font_requirements": "Ensure fallback fonts support the complex scripts of the selected Indic languages natively on iOS and Android."
+  },
+  "instructions_to_main_agent": [
+    "Use expo-router for all navigation (tabs and stacks).",
+    "Implement a Context or Zustand store for Theme and Language management.",
+    "Ensure all colors map correctly based on the active theme state.",
+    "For the Reader, map HTML content using a library like `react-native-render-html` and apply the `body_reading` typography scale.",
+    "TTS requires exact sentence tokenization to support the synchronized highlight effect.",
+    "Strictly follow the JSON structure and color codes provided, ensuring the Amber/Gold (#D9A95C) accent is prominently featured as requested by the user."
+  ]
+}
