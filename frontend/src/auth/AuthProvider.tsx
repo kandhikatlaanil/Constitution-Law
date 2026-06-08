@@ -16,6 +16,7 @@ export interface AppUser {
   language: string;
   theme: string;
   notifications: boolean;
+  subscription_plan: string;
 }
 
 interface AuthResponse {
@@ -33,10 +34,17 @@ interface AuthContextValue {
   signInGoogle: () => Promise<void>;
   signOut: () => Promise<void>;
   patchUser: (p: Partial<AppUser>) => void;
+  changeSubscriptionPlan: (plan: "basic" | "pro" | "plus") => Promise<void>;
 }
 
 const AuthContext = createContext<AuthContextValue | undefined>(undefined);
 const TOKEN_KEY = "auth_token";
+
+function parseAccessToken(url: string): string | null {
+  if (!url) return null;
+  const match = url.match(/[#&]access_token=([^&]+)/);
+  return match ? decodeURIComponent(match[1]) : null;
+}
 
 function parseSessionId(url: string): string | null {
   if (!url) return null;
@@ -64,35 +72,58 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     [persistToken],
   );
 
-  const processSessionId = useCallback(
-    async (sessionId: string) => {
-      const res = await api.post<AuthResponse>("/auth/google/session", { session_id: sessionId });
-      await applyAuth(res);
+  const processTokenOrSessionId = useCallback(
+    async (tokenOrSid: string, isAccessToken: boolean) => {
+      if (isAccessToken) {
+        await persistToken(tokenOrSid);
+        const me = await api.get<{ user: AppUser }>("/auth/me");
+        setUser(me.user);
+      } else {
+        const res = await api.post<AuthResponse>("/auth/google/session", { session_id: tokenOrSid });
+        await applyAuth(res);
+      }
     },
-    [applyAuth],
+    [persistToken, applyAuth],
   );
 
-  // Bootstrap: process web session_id first, else restore stored token.
+  const url = Linking.useURL();
+
+  // 1. URL listener for auth deep links
+  useEffect(() => {
+    if (!url) return;
+    const token = parseAccessToken(url);
+    const sid = parseSessionId(url);
+    if (!token && !sid) return;
+
+    setLoading(true);
+    (async () => {
+      try {
+        if (token) {
+          await processTokenOrSessionId(token, true);
+        } else if (sid) {
+          await processTokenOrSessionId(sid, false);
+        }
+        if (Platform.OS === "web" && typeof window !== "undefined") {
+          window.history.replaceState(null, "", window.location.pathname);
+        }
+      } catch (e) {
+        console.error("[AuthProvider] URL auth failed:", e);
+      } finally {
+        setLoading(false);
+      }
+    })();
+  }, [url, processTokenOrSessionId]);
+
+  // 2. Restore token from storage on mount (if no deep link is being processed)
   useEffect(() => {
     (async () => {
       try {
-        if (Platform.OS === "web" && typeof window !== "undefined") {
-          const sid = parseSessionId(window.location.hash) || parseSessionId(window.location.search);
-          if (sid) {
-            await processSessionId(sid);
-            window.history.replaceState(null, "", window.location.pathname);
-            setLoading(false);
-            return;
-          }
-        } else {
-          const initialUrl = await Linking.getInitialURL();
-          const sid = initialUrl ? parseSessionId(initialUrl) : null;
-          if (sid) {
-            await processSessionId(sid);
-            setLoading(false);
-            return;
-          }
+        const currentUrl = await Linking.getInitialURL();
+        if (currentUrl && (parseAccessToken(currentUrl) || parseSessionId(currentUrl))) {
+          // Let the URL listener handle it
+          return;
         }
+
         const token = await storage.secureGet<string>(TOKEN_KEY, "");
         if (token) {
           setAuthToken(token);
@@ -104,19 +135,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             await storage.secureRemove(TOKEN_KEY);
           }
         }
-      } catch {
-        /* ignore */
+      } catch (e) {
+        console.warn("[AuthProvider] Bootstrap error:", e);
       } finally {
         setLoading(false);
       }
     })();
-    // hot deep-link listener (mobile)
-    const sub = Linking.addEventListener("url", ({ url }) => {
-      const sid = parseSessionId(url);
-      if (sid) processSessionId(sid).catch(() => {});
-    });
-    return () => sub.remove();
-  }, [processSessionId]);
+  }, []);
 
   const signInEmail = async (email: string, password: string) => {
     const res = await api.post<AuthResponse>("/auth/login", { email, password });
@@ -138,16 +163,29 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       Platform.OS === "web" && typeof window !== "undefined"
         ? window.location.origin + "/"
         : Linking.createURL("auth");
-    const authUrl = `https://auth.emergentagent.com/?redirect=${encodeURIComponent(redirectUrl)}`;
+    const supabaseUrl = process.env.EXPO_PUBLIC_SUPABASE_URL || "https://cwwqnmnnpkyowxkfvruc.supabase.co";
+    const authUrl = `${supabaseUrl}/auth/v1/authorize?provider=google&redirect_to=${encodeURIComponent(redirectUrl)}`;
     if (Platform.OS === "web" && typeof window !== "undefined") {
       window.location.href = authUrl;
       return;
     }
     const result = await WebBrowser.openAuthSessionAsync(authUrl, redirectUrl);
     if (result.type === "success" && result.url) {
+      const token = parseAccessToken(result.url);
+      if (token) {
+        await processTokenOrSessionId(token, true);
+        return;
+      }
       const sid = parseSessionId(result.url);
-      if (sid) await processSessionId(sid);
+      if (sid) {
+        await processTokenOrSessionId(sid, false);
+      }
     }
+  };
+
+  const changeSubscriptionPlan = async (plan: "basic" | "pro" | "plus") => {
+    const res = await api.post<{ user: AppUser }>("/auth/subscription", { plan });
+    setUser(res.user);
   };
 
   const signOut = async () => {
@@ -166,7 +204,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   return (
     <AuthContext.Provider
-      value={{ user, loading, signInEmail, registerEmail, signInGuest, signInGoogle, signOut, patchUser }}
+      value={{ user, loading, signInEmail, registerEmail, signInGuest, signInGoogle, signOut, patchUser, changeSubscriptionPlan }}
     >
       {children}
     </AuthContext.Provider>

@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { View, StyleSheet, Share } from "react-native";
+import { View, StyleSheet, Share, Alert } from "react-native";
 import { router } from "expo-router";
 import { useI18n } from "@/src/i18n/LanguageProvider";
 import { useReader } from "@/src/reader/ReaderProvider";
@@ -23,7 +23,7 @@ const parseNum = (s: string): number | null => {
 export default function ConstitutionScreen() {
   const { t, lang, meta, setLang } = useI18n();
   const reader = useReader();
-  const { patchUser } = useAuth();
+  const { user, patchUser } = useAuth();
   const { isBookmarked, toggleBookmark, recordRecent } = useUserData();
 
   const [parts, setParts] = useState<Part[]>([]);
@@ -98,6 +98,14 @@ export default function ConstitutionScreen() {
   }, [detail, t]);
 
   const onChangeLang = (code: string) => {
+    const plan = user?.subscription_plan || "basic";
+    if (plan !== "plus") {
+      Alert.alert(
+        t("subscription_required") || "Subscription Required",
+        t("lang_upgrade_msg") || "Changing language is available only on the Plus plan. Please upgrade in the You settings screen."
+      );
+      return;
+    }
     if (detail) desiredNumberRef.current = parseNum(detail.article_number);
     setLang(code as LangCode);
     patchUser({ language: code });
@@ -112,6 +120,14 @@ export default function ConstitutionScreen() {
   }, [detail, t]);
 
   const onListen = () => {
+    const plan = user?.subscription_plan || "basic";
+    if (plan === "basic") {
+      Alert.alert(
+        t("subscription_required") || "Subscription Required",
+        t("tts_upgrade_msg") || "Text-to-Speech is available only on Pro and Plus plans. Please upgrade in the You settings screen."
+      );
+      return;
+    }
     if (tts.isActive) tts.togglePlay();
     else tts.play();
   };

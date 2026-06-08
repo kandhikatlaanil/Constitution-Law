@@ -13,7 +13,7 @@ from pydantic import BaseModel, EmailStr, Field
 from typing import List, Optional
 from datetime import datetime, timezone, timedelta
 
-from supabase_client import sb_get, sb_get_one
+from supabase_client import sb_get, sb_get_one, sb_post, sb_patch
 from content_parser import parse_html_to_segments, plain_text_from_segments
 
 ROOT_DIR = Path(__file__).parent
@@ -42,9 +42,9 @@ LANGUAGES = [
     {"code": "en-IN", "label": "English", "native": "English", "glyph": "EN"},
     {"code": "hi-IN", "label": "Hindi", "native": "हिंदी", "glyph": "हिं"},
     {"code": "te-IN", "label": "Telugu", "native": "తెలుగు", "glyph": "తె"},
-    {"code": "ta-IN", "label": "Tamil", "native": "தமிழ்", "glyph": "த"},
+    {"code": "ta-IN", "label": "Tamil", "native": "தமிழ்", "glyph": "త"},
     {"code": "kn-IN", "label": "Kannada", "native": "ಕನ್ನಡ", "glyph": "ಕ"},
-    {"code": "ml-IN", "label": "Malayalam", "native": "മലയാളം", "glyph": "മ"},
+    {"code": "ml-IN", "label": "Malayalam", "native": "മലയാളം", "glyph": "మ"},
 ]
 DEFAULT_LANG = "en-IN"
 
@@ -78,14 +78,118 @@ def _public_user(u: dict) -> dict:
         "language": u.get("language", DEFAULT_LANG),
         "theme": u.get("theme", "dark"),
         "notifications": u.get("notifications", True),
+        "subscription_plan": u.get("subscription_plan", "basic"),
     }
+
+
+async def get_supabase_user(token: str) -> Optional[dict]:
+    url = f"{os.environ['SUPABASE_URL'].rstrip('/')}/auth/v1/user"
+    headers = {
+        "apikey": os.environ["SUPABASE_SERVICE_KEY"],
+        "Authorization": f"Bearer {token}"
+    }
+    async with httpx.AsyncClient(timeout=10) as client:
+        try:
+            r = await client.get(url, headers=headers)
+            if r.status_code == 200:
+                sb_user = r.json()
+                uid = sb_user["id"]
+                
+                profile = None
+                try:
+                    profile = await sb_get_one("mobile_users", {"id": f"eq.{uid}"})
+                except Exception as e:
+                    logger.warning("Supabase mobile_users query failed, falling back to MongoDB: %s", e)
+                    db_profile = await db.users.find_one({"user_id": uid}, {"_id": 0})
+                    if db_profile:
+                        profile = {
+                            "id": db_profile["user_id"],
+                            "email": db_profile.get("email"),
+                            "name": db_profile.get("name"),
+                            "picture": db_profile.get("picture"),
+                            "provider": db_profile.get("provider", "google"),
+                            "language": db_profile.get("language", DEFAULT_LANG),
+                            "theme": db_profile.get("theme", "dark"),
+                            "notifications": db_profile.get("notifications", True),
+                            "subscription_plan": db_profile.get("subscription_plan", "basic")
+                        }
+
+                if not profile:
+                    # Auto-create profile
+                    email = sb_user.get("email")
+                    meta = sb_user.get("user_metadata") or {}
+                    name = meta.get("name") or meta.get("full_name") or (email.split("@")[0] if email else "Google User")
+                    picture = meta.get("avatar_url") or meta.get("picture")
+                    profile = {
+                        "id": uid,
+                        "email": email,
+                        "name": name,
+                        "picture": picture,
+                        "provider": sb_user.get("app_metadata", {}).get("provider") or "google",
+                        "language": DEFAULT_LANG,
+                        "theme": "dark",
+                        "notifications": True,
+                        "subscription_plan": "basic"
+                    }
+                    try:
+                        await sb_post("mobile_users", profile)
+                    except Exception as e:
+                        logger.warning("Supabase profile insert failed, saving to MongoDB: %s", e)
+                        mongo_user = {
+                            "user_id": uid,
+                            "email": email,
+                            "name": name,
+                            "picture": picture,
+                            "provider": profile["provider"],
+                            "language": DEFAULT_LANG,
+                            "theme": "dark",
+                            "notifications": True,
+                            "subscription_plan": "basic",
+                            "created_at": datetime.now(timezone.utc)
+                        }
+                        try:
+                            await db.users.update_one({"user_id": uid}, {"$set": mongo_user}, upsert=True)
+                        except Exception as mongo_err:
+                            logger.warning("MongoDB upsert by user_id failed: %s", mongo_err)
+                            if email:
+                                logger.info("Attempting fallback update by email: %s", email)
+                                await db.users.update_one(
+                                    {"email": email},
+                                    {"$set": {
+                                        "user_id": uid,
+                                        "name": name,
+                                        "picture": picture,
+                                        "provider": profile["provider"]
+                                    }},
+                                    upsert=True
+                                )
+                            else:
+                                raise mongo_err
+                
+                return {
+                    "user_id": profile["id"] or profile.get("user_id"),
+                    "email": profile.get("email"),
+                    "name": profile.get("name"),
+                    "picture": profile.get("picture"),
+                    "provider": profile.get("provider"),
+                    "language": profile.get("language"),
+                    "theme": profile.get("theme"),
+                    "notifications": profile.get("notifications"),
+                    "subscription_plan": profile.get("subscription_plan") or "basic"
+                }
+            else:
+                logger.error("Supabase /auth/v1/user verification call failed (HTTP %d): %s", r.status_code, r.text)
+        except Exception as e:
+            logger.error("Error verifying Supabase token: %s", e)
+    return None
 
 
 async def get_current_user(authorization: Optional[str] = Header(None)) -> dict:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Not authenticated")
     token = authorization.split(" ", 1)[1].strip()
-    # 1) Try JWT (email/guest)
+    
+    # 1) Try local guest JWT
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
         user = await db.users.find_one({"user_id": payload["sub"]}, {"_id": 0})
@@ -93,7 +197,13 @@ async def get_current_user(authorization: Optional[str] = Header(None)) -> dict:
             return user
     except jwt.PyJWTError:
         pass
-    # 2) Try Emergent/Google session token
+        
+    # 2) Try Supabase Token
+    sb_user = await get_supabase_user(token)
+    if sb_user:
+        return sb_user
+        
+    # 3) Try Emergent/Google session token (fallback)
     session = await db.user_sessions.find_one({"session_token": token}, {"_id": 0})
     if session:
         exp = session.get("expires_at")
@@ -104,6 +214,7 @@ async def get_current_user(authorization: Optional[str] = Header(None)) -> dict:
         user = await db.users.find_one({"user_id": session["user_id"]}, {"_id": 0})
         if user:
             return user
+            
     raise HTTPException(status_code=401, detail="Invalid token")
 
 
@@ -132,7 +243,6 @@ class GoogleSessionReq(BaseModel):
 async def _create_user(email, name, provider, password_hash=None, picture=None):
     user = {
         "user_id": f"user_{uuid.uuid4().hex[:12]}",
-        "email": email,
         "name": name,
         "picture": picture,
         "provider": provider,
@@ -140,35 +250,145 @@ async def _create_user(email, name, provider, password_hash=None, picture=None):
         "language": DEFAULT_LANG,
         "theme": "dark",
         "notifications": True,
+        "subscription_plan": "basic",
         "created_at": datetime.now(timezone.utc),
     }
+    if email is not None:
+        user["email"] = email
     await db.users.insert_one(dict(user))
     return user
 
 
 @api_router.post("/auth/register")
 async def register(req: RegisterReq):
-    existing = await db.users.find_one({"email": req.email.lower()})
-    if existing:
-        raise HTTPException(status_code=400, detail="An account with this email already exists")
-    user = await _create_user(req.email.lower(), req.name, "email", hash_password(req.password))
-    token = create_jwt(user["user_id"])
-    return {"token": token, "token_type": "jwt", "user": _public_user(user)}
+    # Register user via Supabase Auth Admin API
+    url = f"{os.environ['SUPABASE_URL'].rstrip('/')}/auth/v1/admin/users"
+    headers = {
+        "apikey": os.environ["SUPABASE_SERVICE_KEY"],
+        "Authorization": f"Bearer {os.environ['SUPABASE_SERVICE_KEY']}"
+    }
+    payload = {
+        "email": req.email.lower(),
+        "password": req.password,
+        "email_confirm": True,
+        "user_metadata": {
+            "name": req.name
+        }
+    }
+    async with httpx.AsyncClient(timeout=15) as client:
+        try:
+            r = await client.post(url, headers=headers, json=payload)
+            if r.status_code != 201 and r.status_code != 200:
+                detail = r.json().get("msg") or "Registration failed in Supabase"
+                raise HTTPException(status_code=400, detail=detail)
+            sb_user = r.json()
+        except Exception as e:
+            if isinstance(e, HTTPException):
+                raise e
+            logger.error("Supabase Admin signup error: %s", e)
+            raise HTTPException(status_code=400, detail="Registration service unavailable")
+
+    uid = sb_user["id"]
+    profile = {
+        "id": uid,
+        "email": req.email.lower(),
+        "name": req.name,
+        "provider": "email",
+        "language": DEFAULT_LANG,
+        "theme": "dark",
+        "notifications": True,
+        "subscription_plan": "basic"
+    }
+    
+    try:
+        await sb_post("mobile_users", profile)
+    except Exception as e:
+        logger.error("Supabase profile insert error: %s", e)
+        # Continue anyway, it will auto-create on /me if missing
+
+    # Authenticate user to get access token
+    login_url = f"{os.environ['SUPABASE_URL'].rstrip('/')}/auth/v1/token?grant_type=password"
+    login_headers = {"apikey": os.environ["SUPABASE_SERVICE_KEY"]}
+    login_payload = {"email": req.email.lower(), "password": req.password}
+    
+    async with httpx.AsyncClient(timeout=10) as client:
+        lr = await client.post(login_url, headers=login_headers, json=login_payload)
+        if lr.status_code != 200:
+            raise HTTPException(status_code=400, detail="Auto-login failed after registration")
+        auth_data = lr.json()
+
+    return {
+        "token": auth_data["access_token"],
+        "token_type": "bearer",
+        "user": {
+            "user_id": uid,
+            "email": profile["email"],
+            "name": profile["name"],
+            "picture": None,
+            "provider": "email",
+            "language": DEFAULT_LANG,
+            "theme": "dark",
+            "notifications": True,
+            "subscription_plan": "basic"
+        }
+    }
 
 
 @api_router.post("/auth/login")
 async def login(req: LoginReq):
-    user = await db.users.find_one({"email": req.email.lower()})
-    if not user or user.get("provider") != "email" or not user.get("password_hash"):
-        raise HTTPException(status_code=401, detail="Invalid email or password")
-    if not verify_password(req.password, user["password_hash"]):
-        raise HTTPException(status_code=401, detail="Invalid email or password")
-    token = create_jwt(user["user_id"])
-    return {"token": token, "token_type": "jwt", "user": _public_user(user)}
+    url = f"{os.environ['SUPABASE_URL'].rstrip('/')}/auth/v1/token?grant_type=password"
+    headers = {"apikey": os.environ["SUPABASE_SERVICE_KEY"]}
+    payload = {"email": req.email.lower(), "password": req.password}
+    
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.post(url, headers=headers, json=payload)
+        if r.status_code != 200:
+            raise HTTPException(status_code=401, detail="Invalid email or password")
+        auth_data = r.json()
+        
+    uid = auth_data["user"]["id"]
+    profile = await sb_get_one("mobile_users", {"id": f"eq.{uid}"})
+    if not profile:
+        profile = {
+            "id": uid,
+            "email": req.email.lower(),
+            "name": auth_data["user"].get("user_metadata", {}).get("name") or req.email.split("@")[0],
+            "provider": "email",
+            "language": DEFAULT_LANG,
+            "theme": "dark",
+            "notifications": True,
+            "subscription_plan": "basic"
+        }
+        try:
+            await sb_post("mobile_users", profile)
+        except Exception as e:
+            logger.error("Supabase profile insert error: %s", e)
+
+    return {
+        "token": auth_data["access_token"],
+        "token_type": "bearer",
+        "user": {
+            "user_id": profile["id"],
+            "email": profile.get("email"),
+            "name": profile.get("name"),
+            "picture": profile.get("picture"),
+            "provider": profile.get("provider"),
+            "language": profile.get("language"),
+            "theme": profile.get("theme"),
+            "notifications": profile.get("notifications"),
+            "subscription_plan": profile.get("subscription_plan") or "basic"
+        }
+    }
 
 
 @api_router.post("/auth/guest")
 async def guest(req: GuestReq):
+    # Track guest activity in Supabase guest_login_activity
+    try:
+        await sb_post("guest_login_activity", {"guest_name": req.name or "Guest"})
+    except Exception as e:
+        logger.error("Failed to log guest activity in Supabase: %s", e)
+
     user = await _create_user(None, req.name or "Guest", "guest")
     token = create_jwt(user["user_id"])
     return {"token": token, "token_type": "jwt", "user": _public_user(user)}
@@ -176,6 +396,7 @@ async def guest(req: GuestReq):
 
 @api_router.post("/auth/google/session")
 async def google_session(req: GoogleSessionReq):
+    # Keep legacy Google session endpoint as fallback, but convert users to Supabase if needed
     async with httpx.AsyncClient(timeout=30) as c:
         resp = await c.get(
             f"{EMERGENT_AUTH_BASE}/auth/v1/env/oauth/session-data",
@@ -192,7 +413,6 @@ async def google_session(req: GoogleSessionReq):
         user = await _create_user(email, data.get("name") or email.split("@")[0],
                                   "google", picture=data.get("picture"))
     else:
-        # backfill picture/name from Google if missing
         await db.users.update_one({"user_id": user["user_id"]},
                                   {"$set": {"picture": data.get("picture") or user.get("picture"),
                                             "name": user.get("name") or data.get("name")}})
@@ -213,7 +433,7 @@ async def google_session(req: GoogleSessionReq):
 
 @api_router.get("/auth/me")
 async def auth_me(user: dict = Depends(get_current_user)):
-    return {"user": _public_user(user)}
+    return {"user": user}
 
 
 @api_router.post("/auth/logout")
@@ -222,6 +442,74 @@ async def logout(authorization: Optional[str] = Header(None)):
         token = authorization.split(" ", 1)[1].strip()
         await db.user_sessions.delete_one({"session_token": token})
     return {"ok": True}
+
+
+class SubscriptionReq(BaseModel):
+    plan: str
+
+
+@api_router.post("/auth/subscription")
+async def update_subscription(req: SubscriptionReq, user: dict = Depends(get_current_user)):
+    plan = req.plan.lower()
+    if plan not in ["basic", "pro", "plus"]:
+        raise HTTPException(status_code=400, detail="Invalid subscription plan")
+        
+    uid = user.get("user_id") or user.get("id")
+    is_guest = user.get("provider") == "guest"
+    
+    if is_guest:
+        await db.users.update_one({"user_id": uid}, {"$set": {"subscription_plan": plan}})
+    else:
+        # 1) Try to update in Supabase mobile_users table
+        try:
+            profile = await sb_get_one("mobile_users", {"id": f"eq.{uid}"})
+            if profile:
+                await sb_patch("mobile_users", {"id": f"eq.{uid}"}, {"subscription_plan": plan})
+            else:
+                await sb_post("mobile_users", {
+                    "id": uid,
+                    "email": user.get("email"),
+                    "name": user.get("name"),
+                    "picture": user.get("picture"),
+                    "provider": user.get("provider", "google"),
+                    "language": user.get("language", DEFAULT_LANG),
+                    "theme": user.get("theme", "dark"),
+                    "notifications": user.get("notifications", True),
+                    "subscription_plan": plan
+                })
+        except Exception as e:
+            logger.warning("Failed to update subscription in Supabase, falling back to MongoDB: %s", e)
+            
+        # 2) Sync to MongoDB fallback as well
+        await db.users.update_one(
+            {"user_id": uid},
+            {"$set": {
+                "user_id": uid,
+                "email": user.get("email"),
+                "name": user.get("name"),
+                "picture": user.get("picture"),
+                "provider": user.get("provider", "google"),
+                "language": user.get("language", DEFAULT_LANG),
+                "theme": user.get("theme", "dark"),
+                "notifications": user.get("notifications", True),
+                "subscription_plan": plan
+            }},
+            upsert=True
+        )
+        
+    updated_user = {
+        "user_id": uid,
+        "email": user.get("email"),
+        "name": user.get("name"),
+        "picture": user.get("picture"),
+        "provider": user.get("provider"),
+        "language": user.get("language"),
+        "theme": user.get("theme"),
+        "notifications": user.get("notifications"),
+        "subscription_plan": plan
+    }
+        
+    return {"user": updated_user}
 
 
 # ----------------------------------------------------------------------------
@@ -589,25 +877,57 @@ async def home(user: dict = Depends(get_current_user)):
 
 @api_router.get("/profile")
 async def get_profile(user: dict = Depends(get_current_user)):
-    return {"user": _public_user(user)}
+    if user.get("provider") == "guest":
+        return {"user": _public_user(user)}
+    return {"user": user}
 
 
 @api_router.put("/settings")
 async def update_settings(req: SettingsReq, user: dict = Depends(get_current_user)):
     updates = {k: v for k, v in req.dict().items() if v is not None}
     if updates:
-        await db.users.update_one({"user_id": user["user_id"]}, {"$set": updates})
-    fresh = await db.users.find_one({"user_id": user["user_id"]}, {"_id": 0})
-    return {"user": _public_user(fresh)}
+        if user.get("provider") == "guest":
+            await db.users.update_one({"user_id": user["user_id"]}, {"$set": updates})
+            fresh = await db.users.find_one({"user_id": user["user_id"]}, {"_id": 0})
+            return {"user": _public_user(fresh)}
+        else:
+            await sb_patch("mobile_users", {"id": f"eq.{user['user_id']}"}, updates)
+            fresh = await sb_get_one("mobile_users", {"id": f"eq.{user['user_id']}"})
+            return {"user": {
+                "user_id": fresh["id"],
+                "email": fresh.get("email"),
+                "name": fresh.get("name"),
+                "picture": fresh.get("picture"),
+                "provider": fresh.get("provider"),
+                "language": fresh.get("language"),
+                "theme": fresh.get("theme"),
+                "notifications": fresh.get("notifications")
+            }}
+    return {"user": user}
 
 
 @api_router.put("/profile")
 async def update_profile(req: ProfileReq, user: dict = Depends(get_current_user)):
     updates = {k: v for k, v in req.dict().items() if v is not None}
     if updates:
-        await db.users.update_one({"user_id": user["user_id"]}, {"$set": updates})
-    fresh = await db.users.find_one({"user_id": user["user_id"]}, {"_id": 0})
-    return {"user": _public_user(fresh)}
+        if user.get("provider") == "guest":
+            await db.users.update_one({"user_id": user["user_id"]}, {"$set": updates})
+            fresh = await db.users.find_one({"user_id": user["user_id"]}, {"_id": 0})
+            return {"user": _public_user(fresh)}
+        else:
+            await sb_patch("mobile_users", {"id": f"eq.{user['user_id']}"}, updates)
+            fresh = await sb_get_one("mobile_users", {"id": f"eq.{user['user_id']}"})
+            return {"user": {
+                "user_id": fresh["id"],
+                "email": fresh.get("email"),
+                "name": fresh.get("name"),
+                "picture": fresh.get("picture"),
+                "provider": fresh.get("provider"),
+                "language": fresh.get("language"),
+                "theme": fresh.get("theme"),
+                "notifications": fresh.get("notifications")
+            }}
+    return {"user": user}
 
 
 @api_router.get("/")

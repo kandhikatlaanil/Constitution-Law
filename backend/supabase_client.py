@@ -29,3 +29,20 @@ async def sb_get(table: str, params: dict):
 async def sb_get_one(table: str, params: dict):
     rows = await sb_get(table, {**params, "limit": 1})
     return rows[0] if rows else None
+
+
+async def sb_post(table: str, data: dict):
+    """POST (insert) a row into a table."""
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(f"{_base()}/{table}", headers=_headers(), json=data)
+        r.raise_for_status()
+        return r.json() if r.status_code != 204 else None
+
+
+async def sb_patch(table: str, query_params: dict, data: dict):
+    """PATCH (update) a row in a table matching query_params."""
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.patch(f"{_base()}/{table}", headers=_headers(), params=query_params, json=data)
+        r.raise_for_status()
+        return r.json() if r.status_code != 204 else None
+

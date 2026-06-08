@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useState, useEffect } from "react";
 import { View, TextInput, TouchableOpacity, StyleSheet, Image, ActivityIndicator } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { KeyboardAwareScrollView } from "react-native-keyboard-controller";
@@ -13,8 +13,16 @@ import { ApiError } from "@/src/api/client";
 export default function AuthScreen() {
   const { colors, fonts } = useTheme();
   const { t } = useI18n();
-  const { signInEmail, registerEmail, signInGuest, signInGoogle } = useAuth();
+  const { user, signInEmail, registerEmail, signInGuest, signInGoogle } = useAuth();
   const insets = useSafeAreaInsets();
+
+  const go = () => router.replace("/(tabs)/home");
+
+  useEffect(() => {
+    if (user) {
+      go();
+    }
+  }, [user]);
 
   const [mode, setMode] = useState<"signin" | "signup">("signin");
   const [name, setName] = useState("");
@@ -22,8 +30,6 @@ export default function AuthScreen() {
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState<null | "form" | "google" | "guest">(null);
   const [error, setError] = useState("");
-
-  const go = () => router.replace("/(tabs)/home");
 
   const submit = async () => {
     setError("");
@@ -39,7 +45,6 @@ export default function AuthScreen() {
     try {
       if (mode === "signup") await registerEmail(name.trim(), email.trim().toLowerCase(), password);
       else await signInEmail(email.trim().toLowerCase(), password);
-      go();
     } catch (e) {
       setError(e instanceof ApiError ? e.message : t("error_generic"));
     } finally {
@@ -52,7 +57,6 @@ export default function AuthScreen() {
     setBusy("guest");
     try {
       await signInGuest();
-      go();
     } catch (e) {
       setError(e instanceof ApiError ? e.message : t("error_generic"));
     } finally {
@@ -65,7 +69,6 @@ export default function AuthScreen() {
     setBusy("google");
     try {
       await signInGoogle();
-      go();
     } catch (e) {
       setError(e instanceof ApiError ? e.message : t("error_generic"));
     } finally {
