@@ -1,58 +1,620 @@
-from fastapi import FastAPI, APIRouter
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, Header, Query
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
 import logging
-from pathlib import Path
-from pydantic import BaseModel, Field
-from typing import List
 import uuid
-from datetime import datetime
+import bcrypt
+import jwt
+import httpx
+from pathlib import Path
+from pydantic import BaseModel, EmailStr, Field
+from typing import List, Optional
+from datetime import datetime, timezone, timedelta
 
+from supabase_client import sb_get, sb_get_one
+from content_parser import parse_html_to_segments, plain_text_from_segments
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
-# MongoDB connection
 mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME']]
 
-# Create the main app without a prefix
-app = FastAPI()
+JWT_SECRET = os.environ['JWT_SECRET']
+JWT_ALGO = "HS256"
+EMERGENT_AUTH_BASE = os.environ.get('EMERGENT_AUTH_BASE', 'https://demobackend.emergentagent.com')
 
-# Create a router with the /api prefix
+app = FastAPI(title="Constitution & Law API")
 api_router = APIRouter(prefix="/api")
 
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logger = logging.getLogger("constlaw")
 
-# Define Models
-class StatusCheck(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    client_name: str
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+# ----------------------------------------------------------------------------
+# Languages
+# ----------------------------------------------------------------------------
+LANGUAGES = [
+    {"code": "en-IN", "label": "English", "native": "English", "glyph": "EN"},
+    {"code": "hi-IN", "label": "Hindi", "native": "हिंदी", "glyph": "हिं"},
+    {"code": "te-IN", "label": "Telugu", "native": "తెలుగు", "glyph": "తె"},
+    {"code": "ta-IN", "label": "Tamil", "native": "தமிழ்", "glyph": "த"},
+    {"code": "kn-IN", "label": "Kannada", "native": "ಕನ್ನಡ", "glyph": "ಕ"},
+    {"code": "ml-IN", "label": "Malayalam", "native": "മലയാളം", "glyph": "മ"},
+]
+DEFAULT_LANG = "en-IN"
 
-class StatusCheckCreate(BaseModel):
-    client_name: str
 
-# Add your routes to the router instead of directly to app
+# ----------------------------------------------------------------------------
+# Auth helpers
+# ----------------------------------------------------------------------------
+def hash_password(pw: str) -> str:
+    return bcrypt.hashpw(pw.encode("utf-8")[:72], bcrypt.gensalt()).decode("utf-8")
+
+
+def verify_password(pw: str, hashed: str) -> bool:
+    try:
+        return bcrypt.checkpw(pw.encode("utf-8")[:72], hashed.encode("utf-8"))
+    except Exception:
+        return False
+
+
+def create_jwt(user_id: str) -> str:
+    payload = {"sub": user_id, "exp": datetime.now(timezone.utc) + timedelta(days=30)}
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGO)
+
+
+def _public_user(u: dict) -> dict:
+    return {
+        "user_id": u["user_id"],
+        "email": u.get("email"),
+        "name": u.get("name"),
+        "picture": u.get("picture"),
+        "provider": u.get("provider"),
+        "language": u.get("language", DEFAULT_LANG),
+        "theme": u.get("theme", "dark"),
+        "notifications": u.get("notifications", True),
+    }
+
+
+async def get_current_user(authorization: Optional[str] = Header(None)) -> dict:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    token = authorization.split(" ", 1)[1].strip()
+    # 1) Try JWT (email/guest)
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
+        user = await db.users.find_one({"user_id": payload["sub"]}, {"_id": 0})
+        if user:
+            return user
+    except jwt.PyJWTError:
+        pass
+    # 2) Try Emergent/Google session token
+    session = await db.user_sessions.find_one({"session_token": token}, {"_id": 0})
+    if session:
+        exp = session.get("expires_at")
+        if exp and exp.tzinfo is None:
+            exp = exp.replace(tzinfo=timezone.utc)
+        if exp and exp < datetime.now(timezone.utc):
+            raise HTTPException(status_code=401, detail="Session expired")
+        user = await db.users.find_one({"user_id": session["user_id"]}, {"_id": 0})
+        if user:
+            return user
+    raise HTTPException(status_code=401, detail="Invalid token")
+
+
+# ----------------------------------------------------------------------------
+# Auth models & routes
+# ----------------------------------------------------------------------------
+class RegisterReq(BaseModel):
+    email: EmailStr
+    password: str = Field(min_length=6)
+    name: str = Field(min_length=1)
+
+
+class LoginReq(BaseModel):
+    email: EmailStr
+    password: str
+
+
+class GuestReq(BaseModel):
+    name: Optional[str] = "Guest"
+
+
+class GoogleSessionReq(BaseModel):
+    session_id: str
+
+
+async def _create_user(email, name, provider, password_hash=None, picture=None):
+    user = {
+        "user_id": f"user_{uuid.uuid4().hex[:12]}",
+        "email": email,
+        "name": name,
+        "picture": picture,
+        "provider": provider,
+        "password_hash": password_hash,
+        "language": DEFAULT_LANG,
+        "theme": "dark",
+        "notifications": True,
+        "created_at": datetime.now(timezone.utc),
+    }
+    await db.users.insert_one(dict(user))
+    return user
+
+
+@api_router.post("/auth/register")
+async def register(req: RegisterReq):
+    existing = await db.users.find_one({"email": req.email.lower()})
+    if existing:
+        raise HTTPException(status_code=400, detail="An account with this email already exists")
+    user = await _create_user(req.email.lower(), req.name, "email", hash_password(req.password))
+    token = create_jwt(user["user_id"])
+    return {"token": token, "token_type": "jwt", "user": _public_user(user)}
+
+
+@api_router.post("/auth/login")
+async def login(req: LoginReq):
+    user = await db.users.find_one({"email": req.email.lower()})
+    if not user or user.get("provider") != "email" or not user.get("password_hash"):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    if not verify_password(req.password, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    token = create_jwt(user["user_id"])
+    return {"token": token, "token_type": "jwt", "user": _public_user(user)}
+
+
+@api_router.post("/auth/guest")
+async def guest(req: GuestReq):
+    user = await _create_user(None, req.name or "Guest", "guest")
+    token = create_jwt(user["user_id"])
+    return {"token": token, "token_type": "jwt", "user": _public_user(user)}
+
+
+@api_router.post("/auth/google/session")
+async def google_session(req: GoogleSessionReq):
+    async with httpx.AsyncClient(timeout=30) as c:
+        resp = await c.get(
+            f"{EMERGENT_AUTH_BASE}/auth/v1/env/oauth/session-data",
+            headers={"X-Session-ID": req.session_id},
+        )
+    if resp.status_code != 200:
+        raise HTTPException(status_code=401, detail="Google sign-in failed. Please try again.")
+    data = resp.json()
+    email = (data.get("email") or "").lower()
+    if not email:
+        raise HTTPException(status_code=401, detail="Could not retrieve Google account email")
+    user = await db.users.find_one({"email": email}, {"_id": 0})
+    if not user:
+        user = await _create_user(email, data.get("name") or email.split("@")[0],
+                                  "google", picture=data.get("picture"))
+    else:
+        # backfill picture/name from Google if missing
+        await db.users.update_one({"user_id": user["user_id"]},
+                                  {"$set": {"picture": data.get("picture") or user.get("picture"),
+                                            "name": user.get("name") or data.get("name")}})
+        user = await db.users.find_one({"user_id": user["user_id"]}, {"_id": 0})
+    session_token = data.get("session_token")
+    await db.user_sessions.update_one(
+        {"session_token": session_token},
+        {"$set": {
+            "session_token": session_token,
+            "user_id": user["user_id"],
+            "expires_at": datetime.now(timezone.utc) + timedelta(days=7),
+            "created_at": datetime.now(timezone.utc),
+        }},
+        upsert=True,
+    )
+    return {"token": session_token, "token_type": "session", "user": _public_user(user)}
+
+
+@api_router.get("/auth/me")
+async def auth_me(user: dict = Depends(get_current_user)):
+    return {"user": _public_user(user)}
+
+
+@api_router.post("/auth/logout")
+async def logout(authorization: Optional[str] = Header(None)):
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization.split(" ", 1)[1].strip()
+        await db.user_sessions.delete_one({"session_token": token})
+    return {"ok": True}
+
+
+# ----------------------------------------------------------------------------
+# Meta
+# ----------------------------------------------------------------------------
+@api_router.get("/meta/languages")
+async def meta_languages():
+    const_langs, law_langs = set(), set()
+    try:
+        for b in await sb_get("books", {"select": "default_language", "is_active": "eq.true"}):
+            if b.get("default_language"):
+                const_langs.add(b["default_language"])
+        for b in await sb_get("law_books", {"select": "default_language", "is_active": "eq.true"}):
+            if b.get("default_language"):
+                law_langs.add(b["default_language"])
+    except Exception as e:
+        logger.warning("meta_languages supabase error: %s", e)
+    available = const_langs | law_langs
+    langs = []
+    for lang_def in LANGUAGES:
+        langs.append({**lang_def,
+                      "constitution_available": lang_def["code"] in const_langs,
+                      "law_available": lang_def["code"] in law_langs,
+                      "available": lang_def["code"] in available})
+    return {"languages": langs, "default": DEFAULT_LANG}
+
+
+# ----------------------------------------------------------------------------
+# Content helpers
+# ----------------------------------------------------------------------------
+async def _constitution_book(lang: str):
+    """Return the Constitution book row for a language, falling back to default."""
+    book = await sb_get_one("books", {"select": "*", "default_language": f"eq.{lang}",
+                                       "is_active": "eq.true",
+                                       "order": "created_at.asc"})
+    if not book and lang != DEFAULT_LANG:
+        book = await sb_get_one("books", {"select": "*", "default_language": f"eq.{DEFAULT_LANG}",
+                                          "is_active": "eq.true", "order": "created_at.asc"})
+    return book
+
+
+def _build_content(row: dict):
+    """Build segments + key_points from a content row (article/section)."""
+    segments, next_id = parse_html_to_segments(row.get("content") or "")
+    # Optional dedicated explanation field
+    explanation = (row.get("explanation") or "").strip()
+    if explanation:
+        head_id = next_id
+        segments.append({"seg_id": head_id, "block_id": 9000, "type": "heading",
+                         "marker": None, "text": "Explanation",
+                         "runs": [{"text": "Explanation", "bold": True, "italic": False}],
+                         "speak": False})
+        exp_segs, next_id = parse_html_to_segments(explanation, start_seg_id=head_id + 1)
+        # shift block ids to avoid collision
+        for s in exp_segs:
+            s["block_id"] += 9001
+        segments += exp_segs
+    # Optional key_points array
+    kps = row.get("key_points") or []
+    if isinstance(kps, list) and kps:
+        bid = 9500
+        segments.append({"seg_id": next_id, "block_id": bid, "type": "heading", "marker": None,
+                         "text": "Key Points",
+                         "runs": [{"text": "Key Points", "bold": True, "italic": False}],
+                         "speak": False})
+        next_id += 1
+        bid += 1
+        for kp in kps:
+            segments.append({"seg_id": next_id, "block_id": bid, "type": "list_item",
+                             "marker": "•", "text": str(kp),
+                             "runs": [{"text": str(kp), "bold": False, "italic": False}],
+                             "speak": True})
+            next_id += 1
+            bid += 1
+    return segments
+
+
+def _related(siblings: List[dict], current_seq: int, number_key: str, n: int = 4):
+    """Pick up to n related siblings, forward-biased like the design."""
+    after = [s for s in siblings if s["sequence_order"] > current_seq]
+    before = [s for s in siblings if s["sequence_order"] < current_seq]
+    after.sort(key=lambda s: s["sequence_order"])
+    before.sort(key=lambda s: s["sequence_order"], reverse=True)
+    chosen = after[:n]
+    if len(chosen) < n:
+        chosen = chosen + before[: (n - len(chosen))]
+    chosen.sort(key=lambda s: s["sequence_order"])
+    return [{"id": s["id"], "number": s[number_key], "title": s.get("title")} for s in chosen]
+
+
+def _neighbors(siblings: List[dict], current_seq: int, number_key: str):
+    prev_s = max([s for s in siblings if s["sequence_order"] < current_seq],
+                 key=lambda s: s["sequence_order"], default=None)
+    next_s = min([s for s in siblings if s["sequence_order"] > current_seq],
+                 key=lambda s: s["sequence_order"], default=None)
+
+    def fmt(s):
+        return {"id": s["id"], "number": s[number_key]} if s else None
+    return fmt(prev_s), fmt(next_s)
+
+
+# ----------------------------------------------------------------------------
+# Constitution routes
+# ----------------------------------------------------------------------------
+@api_router.get("/constitution/parts")
+async def constitution_parts(lang: str = Query(DEFAULT_LANG)):
+    book = await _constitution_book(lang)
+    if not book:
+        return {"book": None, "language": lang, "parts": []}
+    parts = await sb_get("parts", {"select": "id,part_number,title,sequence_order",
+                                    "book_id": f"eq.{book['id']}", "order": "sequence_order.asc"})
+    part_ids = [p["id"] for p in parts]
+    articles = []
+    if part_ids:
+        ids = ",".join(part_ids)
+        articles = await sb_get("articles", {
+            "select": "id,article_number,title,sequence_order,part_id",
+            "part_id": f"in.({ids})", "order": "sequence_order.asc"})
+    by_part = {}
+    for a in articles:
+        by_part.setdefault(a["part_id"], []).append({
+            "id": a["id"], "article_number": a["article_number"],
+            "title": a["title"], "sequence_order": a["sequence_order"]})
+    out_parts = [{
+        "id": p["id"], "part_number": p["part_number"], "title": p["title"],
+        "sequence_order": p["sequence_order"], "articles": by_part.get(p["id"], [])
+    } for p in parts]
+    return {"book": {"id": book["id"], "title": book["title"]},
+            "language": book["default_language"], "parts": out_parts}
+
+
+@api_router.get("/constitution/articles/{article_id}")
+async def constitution_article(article_id: str):
+    row = await sb_get_one("articles", {"select": "*", "id": f"eq.{article_id}"})
+    if not row:
+        raise HTTPException(status_code=404, detail="Article not found")
+    segments = _build_content(row)
+    siblings = await sb_get("articles", {
+        "select": "id,article_number,title,sequence_order",
+        "part_id": f"eq.{row['part_id']}", "order": "sequence_order.asc"})
+    prev_s, next_s = _neighbors(siblings, row["sequence_order"], "article_number")
+    related = _related([s for s in siblings if s["id"] != article_id],
+                       row["sequence_order"], "article_number")
+    part = await sb_get_one("parts", {"select": "id,part_number,title", "id": f"eq.{row['part_id']}"})
+    return {
+        "id": row["id"], "article_number": row["article_number"], "title": row["title"],
+        "language": row.get("language"), "voice_id": row.get("voice_id"),
+        "audio_url": row.get("audio_url"), "book_id": part and part.get("id"),
+        "part": part, "segments": segments,
+        "tts_text": plain_text_from_segments(segments),
+        "related": related, "prev": prev_s, "next": next_s,
+    }
+
+
+@api_router.get("/constitution/search")
+async def constitution_search(q: str = Query(...), lang: str = Query(DEFAULT_LANG)):
+    book = await _constitution_book(lang)
+    if not book or not q.strip():
+        return {"results": []}
+    parts = await sb_get("parts", {"select": "id", "book_id": f"eq.{book['id']}"})
+    part_ids = [p["id"] for p in parts]
+    if not part_ids:
+        return {"results": []}
+    ids = ",".join(part_ids)
+    term = q.strip().replace(",", " ")
+    rows = await sb_get("articles", {
+        "select": "id,article_number,title,sequence_order",
+        "part_id": f"in.({ids})",
+        "or": f"(article_number.ilike.*{term}*,title.ilike.*{term}*,content.ilike.*{term}*)",
+        "order": "sequence_order.asc", "limit": 40})
+    return {"results": [{"id": r["id"], "number": r["article_number"], "title": r["title"]}
+                        for r in rows]}
+
+
+# ----------------------------------------------------------------------------
+# Law routes
+# ----------------------------------------------------------------------------
+@api_router.get("/law/books")
+async def law_books(lang: str = Query(DEFAULT_LANG)):
+    rows = await sb_get("law_books", {"select": "id,title,default_language",
+                                      "default_language": f"eq.{lang}", "is_active": "eq.true",
+                                      "order": "created_at.asc"})
+    if not rows and lang != DEFAULT_LANG:
+        rows = await sb_get("law_books", {"select": "id,title,default_language",
+                                          "default_language": f"eq.{DEFAULT_LANG}",
+                                          "is_active": "eq.true", "order": "created_at.asc"})
+    return {"books": rows, "language": rows[0]["default_language"] if rows else lang}
+
+
+@api_router.get("/law/chapters")
+async def law_chapters(book_id: str = Query(...)):
+    rows = await sb_get("law_chapters", {"select": "id,chapter_number,title,sequence_order",
+                                         "book_id": f"eq.{book_id}", "order": "sequence_order.asc"})
+    return {"chapters": rows}
+
+
+@api_router.get("/law/chapters/{chapter_id}/sections")
+async def law_chapter_sections(chapter_id: str):
+    rows = await sb_get("law_sections", {"select": "id,section_number,title,sequence_order",
+                                         "chapter_id": f"eq.{chapter_id}",
+                                         "order": "sequence_order.asc"})
+    return {"sections": rows}
+
+
+@api_router.get("/law/sections/{section_id}")
+async def law_section(section_id: str):
+    row = await sb_get_one("law_sections", {"select": "*", "id": f"eq.{section_id}"})
+    if not row:
+        raise HTTPException(status_code=404, detail="Section not found")
+    segments = _build_content(row)
+    siblings = await sb_get("law_sections", {
+        "select": "id,section_number,title,sequence_order",
+        "chapter_id": f"eq.{row['chapter_id']}", "order": "sequence_order.asc"})
+    prev_s, next_s = _neighbors(siblings, row["sequence_order"], "section_number")
+    related = _related([s for s in siblings if s["id"] != section_id],
+                       row["sequence_order"], "section_number")
+    chapter = await sb_get_one("law_chapters", {"select": "id,chapter_number,title,book_id",
+                                                "id": f"eq.{row['chapter_id']}"})
+    book = None
+    if chapter:
+        book = await sb_get_one("law_books", {"select": "id,title,default_language",
+                                              "id": f"eq.{chapter['book_id']}"})
+    return {
+        "id": row["id"], "section_number": row["section_number"], "title": row["title"],
+        "language": row.get("language") or (book and book.get("default_language")),
+        "voice_id": row.get("voice_id"), "audio_url": row.get("audio_url"),
+        "chapter": chapter, "book": book, "segments": segments,
+        "tts_text": plain_text_from_segments(segments),
+        "related": related, "prev": prev_s, "next": next_s,
+    }
+
+
+@api_router.get("/law/search")
+async def law_search(q: str = Query(...), lang: str = Query(DEFAULT_LANG),
+                     book_id: Optional[str] = Query(None)):
+    if not q.strip():
+        return {"results": []}
+    if book_id:
+        book_ids = [book_id]
+    else:
+        books = await sb_get("law_books", {"select": "id", "default_language": f"eq.{lang}",
+                                           "is_active": "eq.true"})
+        if not books and lang != DEFAULT_LANG:
+            books = await sb_get("law_books", {"select": "id",
+                                               "default_language": f"eq.{DEFAULT_LANG}",
+                                               "is_active": "eq.true"})
+        book_ids = [b["id"] for b in books]
+    if not book_ids:
+        return {"results": []}
+    chapters = await sb_get("law_chapters", {"select": "id",
+                                             "book_id": f"in.({','.join(book_ids)})"})
+    chapter_ids = [c["id"] for c in chapters]
+    if not chapter_ids:
+        return {"results": []}
+    term = q.strip().replace(",", " ")
+    rows = await sb_get("law_sections", {
+        "select": "id,section_number,title,sequence_order",
+        "chapter_id": f"in.({','.join(chapter_ids)})",
+        "or": f"(section_number.ilike.*{term}*,title.ilike.*{term}*,content.ilike.*{term}*)",
+        "order": "sequence_order.asc", "limit": 40})
+    return {"results": [{"id": r["id"], "number": r["section_number"], "title": r["title"]}
+                        for r in rows]}
+
+
+# ----------------------------------------------------------------------------
+# User: bookmarks, recents, profile/settings
+# ----------------------------------------------------------------------------
+class BookmarkReq(BaseModel):
+    kind: str  # 'article' | 'section'
+    ref_id: str
+    number: str
+    title: Optional[str] = None
+    subtitle: Optional[str] = None
+    lang: Optional[str] = None
+    book_id: Optional[str] = None
+
+
+class RecentReq(BookmarkReq):
+    pass
+
+
+class SettingsReq(BaseModel):
+    language: Optional[str] = None
+    theme: Optional[str] = None
+    notifications: Optional[bool] = None
+
+
+class ProfileReq(BaseModel):
+    name: Optional[str] = None
+    picture: Optional[str] = None
+
+
+@api_router.get("/bookmarks")
+async def get_bookmarks(kind: Optional[str] = None, user: dict = Depends(get_current_user)):
+    q = {"user_id": user["user_id"]}
+    if kind:
+        q["kind"] = kind
+    rows = await db.bookmarks.find(q, {"_id": 0}).sort("created_at", -1).to_list(200)
+    return {"bookmarks": rows}
+
+
+@api_router.get("/bookmarks/ids")
+async def get_bookmark_ids(user: dict = Depends(get_current_user)):
+    rows = await db.bookmarks.find({"user_id": user["user_id"]}, {"_id": 0, "ref_id": 1}).to_list(500)
+    return {"ids": [r["ref_id"] for r in rows]}
+
+
+@api_router.post("/bookmarks")
+async def add_bookmark(req: BookmarkReq, user: dict = Depends(get_current_user)):
+    doc = {**req.dict(), "user_id": user["user_id"], "created_at": datetime.now(timezone.utc)}
+    await db.bookmarks.update_one(
+        {"user_id": user["user_id"], "ref_id": req.ref_id},
+        {"$set": doc}, upsert=True)
+    return {"bookmarked": True, "ref_id": req.ref_id}
+
+
+@api_router.delete("/bookmarks/{ref_id}")
+async def remove_bookmark(ref_id: str, user: dict = Depends(get_current_user)):
+    await db.bookmarks.delete_one({"user_id": user["user_id"], "ref_id": ref_id})
+    return {"bookmarked": False, "ref_id": ref_id}
+
+
+@api_router.post("/recents")
+async def add_recent(req: RecentReq, user: dict = Depends(get_current_user)):
+    doc = {**req.dict(), "user_id": user["user_id"], "updated_at": datetime.now(timezone.utc)}
+    await db.recents.update_one(
+        {"user_id": user["user_id"], "ref_id": req.ref_id},
+        {"$set": doc}, upsert=True)
+    # keep only the latest 50
+    extra = await db.recents.find({"user_id": user["user_id"]}, {"_id": 1}) \
+        .sort("updated_at", -1).skip(50).to_list(200)
+    if extra:
+        await db.recents.delete_many({"_id": {"$in": [e["_id"] for e in extra]}})
+    return {"ok": True}
+
+
+@api_router.get("/recents")
+async def get_recents(kind: Optional[str] = None, limit: int = 20,
+                      user: dict = Depends(get_current_user)):
+    q = {"user_id": user["user_id"]}
+    if kind:
+        q["kind"] = kind
+    rows = await db.recents.find(q, {"_id": 0}).sort("updated_at", -1).to_list(limit)
+    return {"recents": rows}
+
+
+@api_router.get("/home")
+async def home(user: dict = Depends(get_current_user)):
+    uid = user["user_id"]
+    recents = await db.recents.find({"user_id": uid}, {"_id": 0}).sort("updated_at", -1).to_list(20)
+    continue_reading = recents[0] if recents else None
+    const_recents = [r for r in recents if r.get("kind") == "article"][:10]
+    law_recents = [r for r in recents if r.get("kind") == "section"][:10]
+    bookmark_count = await db.bookmarks.count_documents({"user_id": uid})
+    articles_read = await db.recents.count_documents({"user_id": uid, "kind": "article"})
+    goal = min(100, int((articles_read / 50) * 100)) if articles_read else 0
+    return {
+        "continue_reading": continue_reading,
+        "constitution_recents": const_recents,
+        "law_recents": law_recents,
+        "stats": {"articles_read": articles_read, "bookmarks": bookmark_count,
+                  "streak_days": 1 if recents else 0, "goal_progress": goal},
+    }
+
+
+@api_router.get("/profile")
+async def get_profile(user: dict = Depends(get_current_user)):
+    return {"user": _public_user(user)}
+
+
+@api_router.put("/settings")
+async def update_settings(req: SettingsReq, user: dict = Depends(get_current_user)):
+    updates = {k: v for k, v in req.dict().items() if v is not None}
+    if updates:
+        await db.users.update_one({"user_id": user["user_id"]}, {"$set": updates})
+    fresh = await db.users.find_one({"user_id": user["user_id"]}, {"_id": 0})
+    return {"user": _public_user(fresh)}
+
+
+@api_router.put("/profile")
+async def update_profile(req: ProfileReq, user: dict = Depends(get_current_user)):
+    updates = {k: v for k, v in req.dict().items() if v is not None}
+    if updates:
+        await db.users.update_one({"user_id": user["user_id"]}, {"$set": updates})
+    fresh = await db.users.find_one({"user_id": user["user_id"]}, {"_id": 0})
+    return {"user": _public_user(fresh)}
+
+
 @api_router.get("/")
 async def root():
-    return {"message": "Hello World"}
+    return {"message": "Constitution & Law API", "status": "ok"}
 
-@api_router.post("/status", response_model=StatusCheck)
-async def create_status_check(input: StatusCheckCreate):
-    status_dict = input.dict()
-    status_obj = StatusCheck(**status_dict)
-    _ = await db.status_checks.insert_one(status_obj.dict())
-    return status_obj
 
-@api_router.get("/status", response_model=List[StatusCheck])
-async def get_status_checks():
-    status_checks = await db.status_checks.find().to_list(1000)
-    return [StatusCheck(**status_check) for status_check in status_checks]
-
-# Include the router in the main app
 app.include_router(api_router)
 
 app.add_middleware(
@@ -63,12 +625,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+
+@app.on_event("startup")
+async def startup():
+    try:
+        await db.users.create_index("email", unique=True, sparse=True)
+        await db.users.create_index("user_id", unique=True)
+        await db.user_sessions.create_index("session_token", unique=True)
+        await db.user_sessions.create_index("expires_at", expireAfterSeconds=0)
+        await db.bookmarks.create_index([("user_id", 1), ("ref_id", 1)], unique=True)
+        await db.recents.create_index([("user_id", 1), ("ref_id", 1)], unique=True)
+        logger.info("Indexes ensured")
+    except Exception as e:
+        logger.warning("Index creation issue: %s", e)
+
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
