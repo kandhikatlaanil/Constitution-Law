@@ -1,14 +1,14 @@
 import React from "react";
-import { ScrollView, View, StyleSheet } from "react-native";
+import { ScrollView, View, StyleSheet, TouchableOpacity } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
+import { router } from "expo-router";
 import { useTheme } from "@/src/theme/ThemeProvider";
 import { useI18n } from "@/src/i18n/LanguageProvider";
 import { Screen, AppText } from "@/src/components/primitives";
 import { ComingSoonCard } from "@/src/components/widgets";
 
 const FEATURES: { icon: keyof typeof Ionicons.glyphMap; title: string }[] = [
-  { icon: "sparkles-outline", title: "AI Legal Assistant" },
   { icon: "calendar-outline", title: "Daily Article" },
   { icon: "map-outline", title: "Guided Articles" },
   { icon: "list-outline", title: "Reading Plans" },
@@ -47,6 +47,23 @@ export default function ExploreScreen() {
             {t("upcoming_features")}
           </AppText>
         </View>
+        <TouchableOpacity onPress={() => router.push("/ai-assistant")} activeOpacity={0.7} testID="explore-ai-assistant">
+          <View style={[styles.csCard, { backgroundColor: colors.surface, borderColor: colors.border }]}>
+            <View style={[styles.csIcon, { backgroundColor: colors.surfaceElevated }]}>
+              <Ionicons name="sparkles-outline" size={22} color={colors.primary} />
+            </View>
+            <View style={{ flex: 1 }}>
+              <AppText variant="uiSemi" color={colors.textPrimary}>
+                AI Legal Assistant
+              </AppText>
+              <AppText variant="small" style={{ marginTop: 2 }}>
+                Ask questions about Constitution, Laws & Education
+              </AppText>
+            </View>
+            <Ionicons name="chevron-forward" size={18} color={colors.textMuted} />
+          </View>
+        </TouchableOpacity>
+
         {FEATURES.map((f) => (
           <ComingSoonCard key={f.title} icon={f.icon} title={f.title} pill={t("coming_soon")} />
         ))}
@@ -62,5 +79,21 @@ const styles = StyleSheet.create({
     padding: 20,
     alignItems: "center",
     marginBottom: 18,
+  },
+  csCard: {
+    flexDirection: "row",
+    alignItems: "center",
+    borderWidth: 1,
+    borderRadius: 14,
+    padding: 14,
+    marginBottom: 10,
+  },
+  csIcon: {
+    width: 44,
+    height: 44,
+    borderRadius: 12,
+    alignItems: "center",
+    justifyContent: "center",
+    marginRight: 12,
   },
 });

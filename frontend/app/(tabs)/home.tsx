@@ -208,7 +208,22 @@ export default function HomeScreen() {
         {/* Upcoming */}
         <View style={{ marginTop: 24 }}>
           <SectionTitle title={t("upcoming_features")} />
-          <ComingSoonCard icon="sparkles-outline" title="AI Legal Assistant" pill={t("coming_soon")} />
+          <TouchableOpacity onPress={() => router.push("/ai-assistant")} activeOpacity={0.7} testID="home-ai-assistant">
+            <View style={[styles.csCard, { backgroundColor: colors.surface, borderColor: colors.border }]}>
+              <View style={[styles.csIcon, { backgroundColor: colors.surfaceElevated }]}>
+                <Ionicons name="sparkles-outline" size={22} color={colors.primary} />
+              </View>
+              <View style={{ flex: 1 }}>
+                <AppText variant="uiSemi" color={colors.textPrimary}>
+                  AI Legal Assistant
+                </AppText>
+                <AppText variant="small" style={{ marginTop: 2 }}>
+                  Ask questions about Constitution, Laws & Education
+                </AppText>
+              </View>
+              <Ionicons name="chevron-forward" size={18} color={colors.textMuted} />
+            </View>
+          </TouchableOpacity>
           <ComingSoonCard icon="calendar-outline" title="Daily Article & Reading Plans" pill={t("coming_soon")} />
           <ComingSoonCard icon="help-circle-outline" title="Quiz & Exam Preparation" pill={t("coming_soon")} />
           <ComingSoonCard icon="medal-outline" title="Streaks, Badges & Achievements" pill={t("coming_soon")} />
@@ -322,5 +337,21 @@ const styles = StyleSheet.create({
     borderRadius: 28,
     alignItems: "center",
     justifyContent: "center",
+  },
+  csCard: {
+    flexDirection: "row",
+    alignItems: "center",
+    borderWidth: 1,
+    borderRadius: 14,
+    padding: 14,
+    marginBottom: 10,
+  },
+  csIcon: {
+    width: 44,
+    height: 44,
+    borderRadius: 12,
+    alignItems: "center",
+    justifyContent: "center",
+    marginRight: 12,
   },
 });

@@ -9,6 +9,8 @@ export const setAuthToken = (token: string | null) => {
   authToken = token;
 };
 
+export const getAuthToken = () => authToken;
+
 export class ApiError extends Error {
   status: number;
   constructor(message: string, status: number) {

@@ -1,8 +1,10 @@
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, Header, Query
+from fastapi.responses import StreamingResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
+import json
 import logging
 import uuid
 import bcrypt
@@ -928,6 +930,180 @@ async def update_profile(req: ProfileReq, user: dict = Depends(get_current_user)
                 "notifications": fresh.get("notifications")
             }}
     return {"user": user}
+
+
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+
+class ChatReq(BaseModel):
+    messages: List[ChatMessage]
+
+
+@api_router.post("/ai/chat")
+async def ai_chat(req: ChatReq, user: dict = Depends(get_current_user)):
+    # 1. Extract the last user message
+    user_msgs = [m for m in req.messages if m.role == "user"]
+    if not user_msgs:
+        raise HTTPException(status_code=400, detail="No user message found")
+    
+    last_query = user_msgs[-1].content
+    
+    # 2. Base clean query for simple keyword matching
+    clean_q = "".join(c for c in last_query if c.isalnum() or c.isspace()).strip()
+    
+    # 3. Retrieve relevant context from DB (RAG)
+    context_parts = []
+    
+    if len(clean_q) >= 3:
+        try:
+            # Query articles (Constitution)
+            articles = await sb_get("articles", {
+                "select": "article_number,title,content,explanation,key_points",
+                "or": f'(title.ilike."*{clean_q}*",content.ilike."*{clean_q}*")',
+                "limit": 3
+            })
+            for a in articles:
+                text = f"Constitution Article {a.get('article_number')}: {a.get('title')}\nContent: {a.get('content')}"
+                if a.get('explanation'):
+                    text += f"\nExplanation: {a.get('explanation')}"
+                context_parts.append(text)
+        except Exception as e:
+            logger.warning("RAG: Error fetching articles: %s", e)
+            
+        try:
+            # Query judgments (Civic Stories / Caselaws)
+            judgments = await sb_get("judgments", {
+                "select": "judgment_title,judgment_date,facts_of_the_case,issues,analysis_of_the_case,conclusion",
+                "or": f'(judgment_title.ilike."*{clean_q}*",facts_of_the_case.ilike."*{clean_q}*")',
+                "limit": 2
+            })
+            for j in judgments:
+                text = f"Landmark Case Judgment: {j.get('judgment_title')} ({j.get('judgment_date')})\nFacts: {j.get('facts_of_the_case')}\nIssues: {j.get('issues')}\nAnalysis: {j.get('analysis_of_the_case')}\nConclusion: {j.get('conclusion')}"
+                context_parts.append(text)
+        except Exception as e:
+            logger.warning("RAG: Error fetching judgments: %s", e)
+            
+        try:
+            # Query law_sections (Laws - filtered to BNS, BNSS, BSA)
+            books = await sb_get("law_books", {})
+            allowed_book_ids = []
+            for b in books:
+                title = b.get("title", "").upper()
+                if any(k in title for k in ["BNS", "BNSS", "BSA"]):
+                    allowed_book_ids.append(b["id"])
+                    
+            if allowed_book_ids:
+                ids_str = ",".join(allowed_book_ids)
+                chapters = await sb_get("law_chapters", {"book_id": f"in.({ids_str})"})
+                allowed_chapter_ids = {c["id"] for c in chapters}
+                
+                if allowed_chapter_ids:
+                    sections = await sb_get("law_sections", {
+                        "select": "section_number,title,content,explanation,key_points,chapter_id",
+                        "or": f'(title.ilike."*{clean_q}*",content.ilike."*{clean_q}*")',
+                        "limit": 20
+                    })
+                    sections_added = 0
+                    for s in sections:
+                        if s.get("chapter_id") in allowed_chapter_ids:
+                            text = f"Law Section {s.get('section_number')}: {s.get('title')}\nContent: {s.get('content')}"
+                            if s.get('explanation'):
+                                text += f"\nExplanation: {s.get('explanation')}"
+                            context_parts.append(text)
+                            sections_added += 1
+                            if sections_added >= 3:
+                                break
+        except Exception as e:
+            logger.warning("RAG: Error fetching law sections: %s", e)
+
+        try:
+            # Query pathway planners
+            pathways = await sb_get("pathway_categories", {
+                "select": "name,description",
+                "or": f'(name.ilike."*{clean_q}*",description.ilike."*{clean_q}*")',
+                "limit": 2
+            })
+            for p in pathways:
+                text = f"Learning Pathway: {p.get('name')}\nDescription: {p.get('description')}"
+                context_parts.append(text)
+        except Exception as e:
+            logger.warning("RAG: Error fetching pathways: %s", e)
+
+    # 4. Formulate the LLM Prompt
+    context_text = "\n\n".join(context_parts) if context_parts else "No specific database context found."
+    
+    system_msg = (
+        "You are the AI Legal Assistant for the Constitution & Law application.\n"
+        "Your scope is STRICTLY limited to answering questions related to:\n"
+        "1. The Constitution of India\n"
+        "2. Indian Law and legal procedures (specifically using BNS, BNSS, BSA for new laws)\n"
+        "3. Education-related questions (e.g. civic literacy, legal education, competitive exam prep, academic curriculum).\n\n"
+        "If the user's request is completely unrelated to these topics (e.g., coding, general science, recipes, creative writing, non-legal trivia), you MUST decline to answer. Politely explain that you are only trained to help with Constitution, Indian Laws, and Education.\n\n"
+        "Here is the context fetched from our application's database (Preamble, Articles, BNS/BNSS/BSA law sections, landmark case judgments, and learning pathways) relevant to the query:\n"
+        f"=== CONTEXT START ===\n{context_text}\n=== CONTEXT END ===\n\n"
+        "Instructions:\n"
+        "- Base your answer on the provided context if possible. If the context does not contain the answer, you can use your general knowledge of the Indian Constitution, Laws, and Education, but clarify that it is not in the local database.\n"
+        "- If the user asks about criminal laws or procedures, refer specifically to the new codes (Bharatiya Nyaya Sanhita - BNS, Bharatiya Nagarik Suraksha Sanhita - BNSS, Bharatiya Sakshya Adhiniyam - BSA) as requested, rather than the old IPC/CrPC/Evidence Act.\n"
+        "- Maintain a helpful, educational, and professional tone."
+    )
+    
+    # 5. Build messages array to send to OpenRouter
+    llm_messages = [{"role": "system", "content": system_msg}]
+    # Append the last few messages for conversation history (limit to last 5 to conserve context token usage)
+    for m in req.messages[-5:]:
+        llm_messages.append({"role": m.role, "content": m.content})
+        
+    # 6. Stream from OpenRouter
+    async def openrouter_streamer():
+        api_key = os.environ.get("OPENROUTER_API_KEY", "")
+        if not api_key:
+            yield "Error: OPENROUTER_API_KEY is not configured in backend .env file."
+            return
+            
+        url = "https://openrouter.ai/api/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://constitutionlaw.app",
+            "X-Title": "Constitution & Law App"
+        }
+        payload = {
+            "model": "openrouter/free",
+            "messages": llm_messages,
+            "stream": True
+        }
+        
+        async with httpx.AsyncClient(timeout=60) as client:
+            try:
+                async with client.stream("POST", url, headers=headers, json=payload) as response:
+                    if response.status_code != 200:
+                        err_text = await response.aread()
+                        yield f"Error from AI Service (HTTP {response.status_code}): {err_text.decode('utf-8', errors='ignore')}"
+                        return
+                        
+                    async for line in response.aiter_lines():
+                        if not line:
+                            continue
+                        line = line.strip()
+                        if line.startswith("data:"):
+                            data_str = line[5:].strip()
+                            if data_str == "[DONE]":
+                                break
+                            try:
+                                data_json = json.loads(data_str)
+                                choice = data_json.get("choices", [{}])[0]
+                                delta = choice.get("delta", {})
+                                content = delta.get("content", "")
+                                if content:
+                                    yield content
+                            except Exception:
+                                pass
+            except Exception as e:
+                yield f"\nConnection Error: {str(e)}"
+                
+    return StreamingResponse(openrouter_streamer(), media_type="text/plain")
 
 
 @api_router.get("/")

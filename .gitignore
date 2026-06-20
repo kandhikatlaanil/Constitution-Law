@@ -92,3 +92,5 @@ credentials.json
 frontend/.metro-cache/
 .expo/
 frontend/.expo/
+cxx/
+
